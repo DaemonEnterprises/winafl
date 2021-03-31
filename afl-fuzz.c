@@ -8104,19 +8104,10 @@ int main(int argc, char** argv) {
   setup_signal_handlers();
   check_asan_opts();
 
-  if (sync_id) fix_up_sync();
+  if (sync_id)
+    fix_up_sync();
 
-  if (use_intelpt) {
-#ifdef INTELPT
-	  char *modules_dir = alloc_printf("%s\\ptmodules", out_dir);
-	  int pt_options = pt_init(argc - optind, argv + optind, modules_dir);
-	  ck_free(modules_dir);
-	  if (!pt_options) usage(argv[0]);
-	  optind += pt_options;
-#endif
-  } else {
-	  extract_client_params(argc, argv);
-  }
+  extract_client_params(argc, argv);
   optind++;
   
   if (!strcmp(in_dir, out_dir))

@@ -290,6 +290,8 @@ int address_range_compare(const void * a, const void * b) {
 }
 
 void build_address_ranges() {
+	// This appears to be a set of address range structures
+	// representing modules to be traced
 	int num_loaded_modules;
 	module_info_t *current_module;
 
@@ -348,126 +350,9 @@ void build_address_ranges() {
 	free(tmp_buf);
 }
 
-// appends new data to the trace_buffer
-void append_trace_data(unsigned char *trace_data, size_t append_size) {
-	size_t space_left = options.trace_buffer_size - trace_size;
-
-	if (!space_left) {
-		// stop collecting trace if the trace buffer is full;
-		printf("Warning: Trace buffer is full\n");
-		return;
-	}
-
-	if (append_size > space_left) {
-		append_size = space_left;
-	}
-
-	if (append_size == 0) return;
-
-	memcpy(trace_buffer + trace_size, trace_data, append_size);
-	trace_size += append_size;
-}
-
-
-// returns true if the ring buffer was overflowed
-bool collect_thread_trace(PIPT_TRACE_HEADER traceHeader) {
-	// printf("ring offset: %u\n", traceHeader->RingBufferOffset);
-
-	bool trace_buffer_overflow = false;
-
-	unsigned char psb_and_psbend[] = {
-		0x02, 0x82, 0x02, 0x82, 0x02, 0x82, 0x02, 0x82,
-		0x02, 0x82, 0x02, 0x82, 0x02, 0x82, 0x02, 0x82,
-		0x02, 0x23
-	};
-
-	trace_size = 0;
-
-	if (options.persistent_trace) {
-
-		// an ugly hack: trace might not start with a psb (synchronization) packet
-		// so we are just adding one. This assumes the state has been properly
-		// flushed when a breakpoint between two iterations has been hit
-		// which does appear to be the case. However, if this doesn't occur
-		// persistent tracing will not work properly
-		append_trace_data(psb_and_psbend, sizeof(psb_and_psbend));
-
-		// first, optimistically assume the buffer didn't overflow
-		if (traceHeader->RingBufferOffset > last_ring_buffer_offset) {
-			append_trace_data(traceHeader->Trace + last_ring_buffer_offset, traceHeader->RingBufferOffset - last_ring_buffer_offset);
-		}
-		else if (traceHeader->RingBufferOffset < last_ring_buffer_offset) {
-			append_trace_data(traceHeader->Trace + last_ring_buffer_offset, traceHeader->TraceSize - last_ring_buffer_offset);
-			append_trace_data(traceHeader->Trace, traceHeader->RingBufferOffset);
-		}
-
-		if (!check_trace_start(trace_buffer, trace_size, (uint64_t)options.fuzz_address)) {
-			// most likely the ring buffer overflowd, extract what we can (trace tail)
-
-			trace_size = 0;
-			trace_buffer_overflow = true;
-
-			printf("Warning: Trace buffer overflowed, trace will be truncated\n");
-			if (options.debug_mode) fprintf(debug_log, "Trace buffer overflowed, trace will be truncated\n");
-
-			char *trailing_data = traceHeader->Trace + traceHeader->RingBufferOffset;
-			size_t trailing_size = traceHeader->TraceSize - traceHeader->RingBufferOffset;
-			append_trace_data(trailing_data, trailing_size);
-
-			append_trace_data(traceHeader->Trace, traceHeader->RingBufferOffset);
-
-		}
-
-		last_ring_buffer_offset = traceHeader->RingBufferOffset;
-
-	} else {
-
-		// check if the trace buffer overflowed
-
-		char *trailing_data = traceHeader->Trace + traceHeader->RingBufferOffset;
-		size_t trailing_size = traceHeader->TraceSize - traceHeader->RingBufferOffset;
-		if (findpsb(&trailing_data, &trailing_size)) {
-			trace_buffer_overflow = true;
-			printf("Warning: Trace buffer overflowed, trace will be truncated\n");
-			if (options.debug_mode) fprintf(debug_log, "Trace buffer overflowed, trace will be truncated\n");
-			append_trace_data(trailing_data, trailing_size);
-		}
-
-		append_trace_data(traceHeader->Trace, traceHeader->RingBufferOffset);
-	}
-
-	return trace_buffer_overflow;
-}
-
-// parse PIPT_TRACE_DATA, extract trace bits and add them to the trace_buffer
-// returns true if the trace ring buffer overflowed
-bool collect_trace(PIPT_TRACE_DATA pTraceData)
-{
-	bool trace_buffer_overflow = false;
-
-	PIPT_TRACE_HEADER traceHeader;
-	DWORD dwTraceSize;
-
-	dwTraceSize = pTraceData->TraceSize;
-
-	traceHeader = (PIPT_TRACE_HEADER)pTraceData->TraceData;
-
-	while (dwTraceSize > (unsigned)(FIELD_OFFSET(IPT_TRACE_HEADER, Trace))) {
-		if (traceHeader->ThreadId == fuzz_thread_id) {
-			trace_buffer_overflow = collect_thread_trace(traceHeader);
-		}
-
-		dwTraceSize -= (FIELD_OFFSET(IPT_TRACE_HEADER, Trace) + traceHeader->TraceSize);
-
-		traceHeader = (PIPT_TRACE_HEADER)(traceHeader->Trace +
-			traceHeader->TraceSize);
-	}
-
-	return trace_buffer_overflow;
-}
-
-// returns an array of handles for all modules loaded in the target process
 DWORD get_all_modules(HMODULE **modules) {
+	// returns an array of handles for all modules loaded in the target process
+
 	DWORD module_handle_storage_size = 1024 * sizeof(HMODULE);
 	HMODULE *module_handles = (HMODULE *)malloc(module_handle_storage_size);
 	DWORD hmodules_size;
@@ -483,8 +368,9 @@ DWORD get_all_modules(HMODULE **modules) {
 	return hmodules_size / sizeof(HMODULE);
 }
 
-// parses PE headers and gets the module entypoint
 void *get_entrypoint(void *base_address) {
+	// parses PE headers and gets the module entypoint
+
 	unsigned char headers[4096];
 	size_t num_read = 0;
 	if (!ReadProcessMemory(child_handle, base_address, headers, 4096, &num_read) || (num_read != 4096)) {
@@ -507,37 +393,43 @@ void *get_entrypoint(void *base_address) {
 	return (char *)base_address + entrypoint_offset;
 }
 
-// adds a breakpoint at a specified address
-// type, module_name and module_base are all additional information
-// that can be accessed later when the breakpoint gets hit
 void add_breakpoint(void *address, int type, char *module_name, void *module_base) {
+	// adds a breakpoint at a specified address
+	// type, module_name and module_base are all additional information
+	// that can be accessed later when the breakpoint gets hit
+
 	struct winafl_breakpoint *new_breakpoint = (struct winafl_breakpoint *)malloc(sizeof(struct winafl_breakpoint));
 	size_t rwsize = 0;
 	if(!ReadProcessMemory(child_handle, address, &(new_breakpoint->original_opcode), 1, &rwsize) || (rwsize != 1)) {
 		FATAL("Error reading target memory\n");
 	}
+
 	rwsize = 0;	
 	unsigned char cc = 0xCC;
+
 	if (!WriteProcessMemory(child_handle, address, &cc, 1, &rwsize) || (rwsize != 1)) {
 		FATAL("Error writing target memory\n");
 	}
+
 	FlushInstructionCache(child_handle, address, 1);
 	new_breakpoint->address = address;
 	new_breakpoint->type = type;
+
 	if (module_name) {
 		strcpy(new_breakpoint->module_name, module_name);
 	} else {
 		new_breakpoint->module_name[0] = 0;
 	}
+
 	new_breakpoint->module_base = module_base;
 	new_breakpoint->next = breakpoints;
 	breakpoints = new_breakpoint;
 }
 
-
-// damn it Windows, why don't you have a GetProcAddress
-// that works on another process
 DWORD get_proc_offset(char *data, char *name) {
+	// damn it Windows, why don't you have a GetProcAddress
+	// that works on another process
+
 	DWORD pe_offset;
 	pe_offset = *((DWORD *)(data + 0x3C));
 	char *pe = data + pe_offset;
@@ -581,8 +473,9 @@ DWORD get_proc_offset(char *data, char *name) {
 	return offset;
 }
 
-// attempt to obtain the fuzz_offset in various ways
 char *get_fuzz_method_offset(HMODULE module) {
+	// attempt to obtain the fuzz_offset in various ways
+
 	MODULEINFO module_info;
 	GetModuleInformation(child_handle, module, &module_info, sizeof(module_info));
 
@@ -597,6 +490,7 @@ char *get_fuzz_method_offset(HMODULE module) {
 	if (!ReadProcessMemory(child_handle, module_info.lpBaseOfDll, modulebuf, module_info.SizeOfImage, &num_read) || (num_read != module_info.SizeOfImage)) {
 		FATAL("Error reading target memory\n");
 	}
+
 	DWORD fuzz_offset = get_proc_offset(modulebuf, options.fuzz_method);
 	free(modulebuf);
 	if (fuzz_offset) {
@@ -615,22 +509,26 @@ char *get_fuzz_method_offset(HMODULE module) {
 		MAX_SYM_NAME * sizeof(TCHAR) +
 		sizeof(ULONG64) - 1) /
 		sizeof(ULONG64)];
+
 	PSYMBOL_INFO pSymbol = (PSYMBOL_INFO)buffer;
 	pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
 	pSymbol->MaxNameLen = MAX_SYM_NAME;
 	SymInitialize(child_handle, NULL, false);
 	DWORD64 sym_base_address = SymLoadModuleEx(child_handle, NULL, module_path, NULL, 0, 0, NULL, 0);
+
 	if (SymFromName(child_handle, options.fuzz_method, pSymbol)) {
 		options.fuzz_offset = (unsigned long)(pSymbol->Address - sym_base_address);
 		fuzz_method = (char *)module_info.lpBaseOfDll + options.fuzz_offset;
 	}
+
 	SymCleanup(child_handle);
 
 	return fuzz_method;
 }
 
-// should we collect coverage for this module
 module_info_t *is_coverage_module(char *module_name) {
+	// should we collect coverage for this module?
+
 	module_info_t *current_module = options.coverage_modules;
 	while (current_module) {
 		if (_stricmp(module_name, current_module->module_name) == 0) {
@@ -641,8 +539,9 @@ module_info_t *is_coverage_module(char *module_name) {
 	return NULL;
 }
 
-// check if the same module was already loaded
 module_info_t *get_loaded_module(char *module_name, void *base) {
+	// check if the same module was already loaded
+
 	module_info_t *current_module = all_modules;
 	while (current_module) {
 		if (_stricmp(module_name, current_module->module_name) == 0) {
@@ -655,9 +554,10 @@ module_info_t *get_loaded_module(char *module_name, void *base) {
 	return NULL;
 }
 
-// find if there is a *different* module that previously occupied
-// the same space
 module_info_t *get_intersecting_module(char *module_name, void *base, DWORD size) {
+	// find if there is a *different* module that previously occupied
+	// the same space
+
 	module_info_t *current_module = all_modules;
 	while (current_module) {
 		if (((uint64_t)current_module->base + current_module->size <= (uint64_t)base) || 
@@ -669,7 +569,6 @@ module_info_t *get_intersecting_module(char *module_name, void *base, DWORD size
 	}
 	return NULL;
 }
-
 
 void on_coverage_module_loaded(HMODULE module, module_info_t *target_module) {
 	MODULEINFO module_info;
@@ -765,8 +664,9 @@ void add_module_to_section_cache(HMODULE module, char *module_name) {
 	all_modules = loaded_module;
 }
 
-// called when a potentialy interesting module gets loaded
 void on_module_loaded(HMODULE module, char *module_name) {
+	// called when a potentialy interesting module gets loaded
+
 	MODULEINFO module_info;
 	GetModuleInformation(child_handle, module, &module_info, sizeof(module_info));
 	// printf("In on_module_loaded, name: %s, base: %p\n", module_name, module_info.lpBaseOfDll);
@@ -825,8 +725,8 @@ void write_stack(void *stack_addr, void **buffer, size_t numitems) {
 	WriteProcessMemory(child_handle, stack_addr, buffer, numitems * child_ptr_size, &numrw);
 }
 
-// called when the target method is called *for the first time only*
 void on_target_method(DWORD thread_id) {
+	// called when the target method is called *for the first time only*
 	// printf("in OnTargetMethod\n");
 
 	fuzz_thread_id = thread_id;
@@ -915,8 +815,8 @@ void on_target_method(DWORD thread_id) {
 	CloseHandle(thread_handle);
 }
 
-// called every time the target method returns
 void on_target_method_ended(DWORD thread_id) {
+	// called every time the target method returns
 	// printf("in OnTargetMethodEnded\n");
 
 	CONTEXT lcContext;
@@ -997,8 +897,8 @@ void on_target_method_ended(DWORD thread_id) {
 	CloseHandle(thread_handle);
 }
 
-// called when process entrypoint gets reached
 void on_entrypoint() {
+	// called when process entrypoint gets reached
 	// printf("Entrypoint\n");
 
 	HMODULE *module_handles = NULL;
@@ -1014,8 +914,9 @@ void on_entrypoint() {
 	child_entrypoint_reached = true;
 }
 
-// called when the debugger hits a breakpoint
 int handle_breakpoint(void *address, DWORD thread_id) {
+	// called when the debugger hits a breakpoint
+
 	int ret = BREAKPOINT_UNKNOWN;
 	size_t rwsize = 0;
 	struct winafl_breakpoint *previous = NULL;
@@ -1023,13 +924,18 @@ int handle_breakpoint(void *address, DWORD thread_id) {
 	while (current) {
 		if (current->address == address) {
 			// unlink the breakpoint
-			if (previous) previous->next = current->next;
-			else breakpoints = current->next;
+			if (previous)
+				previous->next = current->next;
+			else
+				breakpoints = current->next;
+
 			// restore address
 			if (!WriteProcessMemory(child_handle, address, &current->original_opcode, 1, &rwsize) || (rwsize != 1)) {
 				FATAL("Error writing child memory\n");
 			}
+
 			FlushInstructionCache(child_handle, address, 1);
+
 			// restore context
 			CONTEXT lcContext;
 			lcContext.ContextFlags = CONTEXT_ALL;
@@ -1056,22 +962,27 @@ int handle_breakpoint(void *address, DWORD thread_id) {
 			default:
 				break;
 			}
+
 			// return the brekpoint type
 			ret = current->type;
+
 			// delete the breakpoint object
 			free(current);
+
 			//done
 			break;
 		}
+
 		previous = current;
 		current = current->next;
 	}
 	return ret;
 }
 
-// standard debugger loop that listens to relevant events in the target process
 int debug_loop()
 {
+	// standard debugger loop that listens to relevant events in the target process
+
 	bool alive = true;
 
 	LPDEBUG_EVENT DebugEv = &dbg_debug_event;
@@ -1176,14 +1087,21 @@ int debug_loop()
 			// Don't do anything until the processentrypoint is reached.
 			// Before that time we can't do much anyway, a lot of calls are going to fail
 			// Modules loaded before entrypoint is reached are going to be enumerated at that time
+
 			if (child_entrypoint_reached) {
 				char filename[MAX_PATH];
 				GetFinalPathNameByHandleA(DebugEv->u.LoadDll.hFile, (LPSTR)(&filename), sizeof(filename), 0);
 				char *base_name = strrchr(filename, '\\');
-				if (base_name) base_name += 1;
-				else base_name = filename;
+
+				if (base_name)
+					base_name += 1;
+				else
+					base_name = filename;
+
 				// printf("Module loaded: %s %p\n", base_name, DebugEv->u.LoadDll.lpBaseOfDll);
-				if (options.debug_mode) fprintf(debug_log, "Module loaded: %s\n", base_name);
+				if (options.debug_mode)
+					fprintf(debug_log, "Module loaded: %s\n", base_name);
+
 				// module isn't fully loaded yet. Instead of processing it now,
 				// add a breakpoint to the module's entrypoint
 				if ((_stricmp(base_name, options.fuzz_module) == 0) || 
@@ -1227,9 +1145,9 @@ int debug_loop()
 	return DEBUGGER_PROCESS_EXIT;
 }
 
-// a simpler debugger loop that just waits for the process to exit
 void wait_process_exit()
 {
+	// a simpler debugger loop that just waits for the process to exit
 	bool alive = true;
 
 	LPDEBUG_EVENT DebugEv = &dbg_debug_event;
@@ -1272,8 +1190,9 @@ void wait_process_exit()
 	}
 }
 
-// starts the target process
 void start_process(char *cmd) {
+	// starts the target process
+
 	STARTUPINFOA si;
 	PROCESS_INFORMATION pi;
 	HANDLE hJob = NULL;
@@ -1371,8 +1290,9 @@ void start_process(char *cmd) {
 	}
 }
 
-// called to resume the target process if it is waiting on a debug event
 void resumes_process() {
+	// called to resume the target process if it is waiting on a debug event
+
 	ContinueDebugEvent(dbg_debug_event.dwProcessId,
 		dbg_debug_event.dwThreadId,
 		dbg_continue_status);
@@ -1380,15 +1300,11 @@ void resumes_process() {
 
 void kill_process() {
 	// end tracing
-	if (options.persistent_trace) {
-		if (!StopProcessIptTracing(child_handle)) {
-			printf("Error stopping ipt trace\n");
-		}
-	}
 
 	TerminateProcess(child_handle, 0);
 
-	if(dbg_continue_needed) resumes_process();
+	if(dbg_continue_needed)
+		resumes_process();
 
 	wait_process_exit();
 
@@ -1405,6 +1321,7 @@ void kill_process() {
 		breakpoint = breakpoint->next;
 		free(tmp);
 	}
+
 	breakpoints = NULL;
 }
 
@@ -1442,24 +1359,8 @@ int run_target_pt(char **argv, uint32_t timeout) {
 		fuzz_iterations_current = 0;
 	}
 
-	if(options.debug_mode) fprintf(debug_log, "iteration %d\n", fuzz_iterations_current);
-
-	// start tracing
-	if ((!options.persistent_trace) || (fuzz_iterations_current == 0)) {
-		IPT_OPTIONS ipt_options;
-		memset(&ipt_options, 0, sizeof(IPT_OPTIONS));
-		ipt_options.OptionVersion = 1;
-		ConfigureBufferSize(options.trace_buffer_size, &ipt_options);
-		ConfigureTraceFlags(0, &ipt_options);
-		if (!StartProcessIptTracing(child_handle, ipt_options)) {
-			FATAL("ipt tracing error\n");
-		}
-		last_ring_buffer_offset = 0;
-	}
-
-	memset(trace_bits, 0, MAP_SIZE);
-
-	dbg_timeout_time = get_cur_time() + timeout;
+	if(options.debug_mode)
+		fprintf(debug_log, "iteration %d\n", fuzz_iterations_current);
 
 	// printf("iteration start\n");
 
@@ -1467,78 +1368,6 @@ int run_target_pt(char **argv, uint32_t timeout) {
 	debugger_status = debug_loop();
 
 	// printf("iteration end\n");
-
-	// collect trace
-	bool trace_buffer_overflowed = false;
-	PIPT_TRACE_DATA trace_data = GetIptTrace(child_handle);
-	if (!trace_data) {
-		printf("Error getting ipt trace\n");
-	} else {
-		trace_buffer_overflowed = collect_trace(trace_data);
-		HeapFree(GetProcessHeap(), 0, trace_data);
-	}
-
-	// end tracing
-	if (!options.persistent_trace) {
-		if (!StopProcessIptTracing(child_handle)) {
-			printf("Error stopping ipt trace\n");
-		}
-	}
-
-	if (need_build_ranges) {
-		build_address_ranges();
-		need_build_ranges = false;
-	}
-
-	// process trace
-
-	// printf("decoding trace of %llu bytes\n", trace_size);
-
-	struct pt_image *image = NULL;
-	if ((options.decoder == DECODER_FULL_FAST) || (options.decoder == DECODER_FULL_REFERENCE)) {
-		image = pt_image_alloc("winafl_image");
-		module_info_t *cur_module = all_modules;
-		while (cur_module) {
-			if (cur_module->isid > 0) {
-				int ret = pt_image_add_cached(image, section_cache, cur_module->isid, NULL);
-			}
-			cur_module = cur_module->next;
-		}
-	}
-
-	if (options.decoder == DECODER_TIP_FAST) {
-		decode_trace_tip_fast(trace_buffer, trace_size, options.coverage_kind);
-#ifdef DECODER_CORRECTNESS_TEST
-		printf("Testing decoder correctness\n");
-		unsigned char *fast_trace_bits = (unsigned char *)malloc(MAP_SIZE);
-		memcpy(fast_trace_bits, trace_bits, MAP_SIZE);
-		memset(trace_bits, 0, MAP_SIZE);
-		decode_trace_tip_reference(trace_buffer, trace_size, options.coverage_kind);
-		if (memcmp(fast_trace_bits, trace_bits, MAP_SIZE)) {
-			FATAL("Fast decoder returned different coverage than the reference decoder");
-		}
-		free(fast_trace_bits);
-#endif
-	} else if (options.decoder == DECODER_TIP_REFERENCE) {
-		decode_trace_tip_reference(trace_buffer, trace_size, options.coverage_kind);
-	} else if (options.decoder == DECODER_FULL_FAST) {
-		analyze_trace_full_fast(trace_buffer, trace_size, options.coverage_kind, image, trace_buffer_overflowed);
-#ifdef DECODER_CORRECTNESS_TEST
-		printf("Testing decoder correctness\n");
-		unsigned char *fast_trace_bits = (unsigned char *)malloc(MAP_SIZE);
-		memcpy(fast_trace_bits, trace_bits, MAP_SIZE);
-		memset(trace_bits, 0, MAP_SIZE);
-		analyze_trace_full_reference(trace_buffer, trace_size, options.coverage_kind, image, trace_buffer_overflowed);
-		if (memcmp(fast_trace_bits, trace_bits, MAP_SIZE)) {
-			FATAL("Fast decoder returned different coverage than the reference decoder");
-		}
-		free(fast_trace_bits);
-#endif
-	} else if (options.decoder == DECODER_FULL_REFERENCE) {
-		analyze_trace_full_reference(trace_buffer, trace_size, options.coverage_kind, image, trace_buffer_overflowed);
-	}
-
-	if(image) pt_image_free(image);
 
 	if (debugger_status == DEBUGGER_PROCESS_EXIT) {
 		CloseHandle(child_handle);
@@ -1557,108 +1386,9 @@ int run_target_pt(char **argv, uint32_t timeout) {
 	}
 
 	fuzz_iterations_current++;
-	if (fuzz_iterations_current == options.fuzz_iterations && child_handle != NULL) {
-		kill_process();
-	}
+	// if (fuzz_iterations_current == options.fuzz_iterations && child_handle != NULL) {
+	//   kill_process();
+	// }
 
 	return ret;
-}
-
-int pt_init(int argc, char **argv, char *module_dir) {
-	child_handle = NULL;
-	child_thread_handle = NULL;
-
-	int lastoption = -1;
-	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--") == 0) {
-			lastoption = i;
-			break;
-		}
-	}
-
-	if (lastoption <= 0) return 0;
-
-	winaflpt_options_init(lastoption - 1, argv + 1);
-	trace_buffer = (unsigned char *)malloc(options.trace_buffer_size);
-
-	if (!EnableAndValidateIptServices()) {
-		FATAL("No IPT\n");
-	} else {
-		printf("IPT service enebled\n");
-	}
-
-	if (options.debug_mode) {
-		debug_log = fopen("debug.log", "w");
-		if (!debug_log) {
-			FATAL("Can't open debug log for writing");
-		}
-	}
-
-	if (options.decoder == DECODER_FULL_FAST || options.decoder == DECODER_FULL_REFERENCE) {
-		section_cache = pt_iscache_alloc("winafl_cache");
-	}
-	strcpy(section_cache_dir, module_dir);
-
-	if (options.decoder == DECODER_FULL_FAST) {
-		if (!options.trace_cache_size) {
-			// simple heuristics for determining tracelet cache size
-			// within reasonable bounds
-			options.trace_cache_size = options.trace_buffer_size * 10;
-			if (options.trace_cache_size < TRACE_CACHE_SIZE_MIN)
-				options.trace_cache_size = TRACE_CACHE_SIZE_MIN;
-			if (options.trace_cache_size > TRACE_CACHE_SIZE_MAX)
-				options.trace_cache_size = TRACE_CACHE_SIZE_MAX;
-
-		}
-		tracelet_cache_init(options.trace_cache_size / 100, options.trace_cache_size);
-	}
-
-	return lastoption;
-}
-
-void debug_target_pt(char **argv) {
-	trace_bits = (u8 *)malloc(MAP_SIZE);
-	u8 * trace_bits_saved = (u8 *)malloc(MAP_SIZE);
-
-	for (int i = 0; i < options.fuzz_iterations; i++) {
-		int ret = run_target_pt(argv, 0xFFFFFFFF);
-
-		// detect variable coverage, could indicate a decoding issue
-		// skip 1st iteration, will likely hit more coverage
-		if (i == 1) {
-			memcpy(trace_bits_saved, trace_bits, MAP_SIZE);
-		} else if(i > 1) {
-			if (memcmp(trace_bits_saved, trace_bits, MAP_SIZE)) {
-				// printf("Info: Variable coverage detected\n");
-			}
-		}
-
-		switch (ret) {
-		case FAULT_NONE:
-			if(debug_log) fprintf(debug_log, "Iteration finished normally\n");
-			break;
-		case FAULT_CRASH:
-			if (debug_log) fprintf(debug_log, "Target crashed\n");
-			break;
-		case FAULT_TMOUT:
-			if (debug_log) fprintf(debug_log, "Target hanged\n");
-			break;
-		}
-	}
-
-	if (debug_log) {
-		fprintf(debug_log, "Coverage map (hex): \n");
-		size_t map_pos = 0;
-		while (1) {
-			for (int i = 0; i < 16; i++) {
-				if (map_pos == MAP_SIZE) break;
-				fprintf(debug_log, "%02X", trace_bits[map_pos]);
-				map_pos++;
-			}
-			fprintf(debug_log, "\n");
-			if (map_pos == MAP_SIZE) break;
-		}
-	}
-
-	if (debug_log) fclose(debug_log);
 }

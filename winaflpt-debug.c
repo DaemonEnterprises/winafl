@@ -124,14 +124,6 @@ char *argv_to_cmd(char** argv) {
 
 int main(int argc, char **argv)
 {
-	_mkdir(".\\ptmodules");
-	int target_opt_ind = pt_init(argc, argv, ".\\ptmodules");
-	if (!target_opt_ind) {
-		printf("Usage: %s <instrumentation-options> -- <target command line>\n", argv[0]);
-		return 0;
-	}
-
-	debug_target_pt(argv + target_opt_ind + 1);
-
+	// Dummy AF
 	return 0;
 }
